@@ -6,22 +6,23 @@ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 import me.jellysquid.mods.sodium.client.SodiumClientMod;
+import me.jellysquid.mods.sodium.client.gl.device.RenderDevice;
 import me.jellysquid.mods.sodium.client.gui.SodiumGameOptions;
 import me.jellysquid.mods.sodium.client.model.vertex.type.ChunkVertexType;
 import me.jellysquid.mods.sodium.client.render.chunk.ChunkRenderBackend;
 import me.jellysquid.mods.sodium.client.render.chunk.ChunkRenderManager;
-import me.jellysquid.mods.sodium.client.render.chunk.backends.gl20.GL20ChunkRenderBackend;
-import me.jellysquid.mods.sodium.client.render.chunk.backends.gl30.GL30ChunkRenderBackend;
-import me.jellysquid.mods.sodium.client.render.chunk.backends.gl43.GL43ChunkRenderBackend;
+import me.jellysquid.mods.sodium.client.render.chunk.backends.multidraw.MultidrawChunkRenderBackend;
+import me.jellysquid.mods.sodium.client.render.chunk.backends.oneshot.ChunkRenderBackendOneshot;
 import me.jellysquid.mods.sodium.client.render.chunk.data.ChunkRenderData;
 import me.jellysquid.mods.sodium.client.render.chunk.format.DefaultModelVertexFormats;
 import me.jellysquid.mods.sodium.client.render.chunk.passes.BlockRenderPass;
 import me.jellysquid.mods.sodium.client.render.chunk.passes.BlockRenderPassManager;
-import me.jellysquid.mods.sodium.client.render.pipeline.context.GlobalRenderContext;
+import me.jellysquid.mods.sodium.client.render.pipeline.context.ChunkRenderCacheShared;
 import me.jellysquid.mods.sodium.client.util.math.FrustumExtended;
 import me.jellysquid.mods.sodium.client.world.ChunkStatusListener;
 import me.jellysquid.mods.sodium.client.world.ChunkStatusListenerManager;
 import me.jellysquid.mods.sodium.common.util.ListUtil;
+import net.coderbot.iris.shadows.ShadowRenderingState;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
@@ -46,7 +47,6 @@ public class SodiumWorldRenderer implements ChunkStatusListener {
     private final MinecraftClient client;
 
     private ClientWorld world;
-    private int renderDistance;
 
     private double lastCameraX, lastCameraY, lastCameraZ;
     private double lastCameraPitch, lastCameraYaw;
@@ -108,7 +108,7 @@ public class SodiumWorldRenderer implements ChunkStatusListener {
     private void loadWorld(ClientWorld world) {
         this.world = world;
 
-        GlobalRenderContext.createRenderContext(this.world);
+        ChunkRenderCacheShared.createRenderContext(this.world);
 
         this.initRenderer();
 
@@ -116,7 +116,7 @@ public class SodiumWorldRenderer implements ChunkStatusListener {
     }
 
     private void unloadWorld() {
-        GlobalRenderContext.destroyRenderContext(this.world);
+        ChunkRenderCacheShared.destroyRenderContext(this.world);
 
         if (this.chunkRenderManager != null) {
             this.chunkRenderManager.destroy();
@@ -147,6 +147,7 @@ public class SodiumWorldRenderer implements ChunkStatusListener {
     public void scheduleTerrainUpdate() {
         // BUG: seems to be called before init
         if (this.chunkRenderManager != null) {
+            this.ensureStateSwapped();
             this.chunkRenderManager.markDirty();
         }
     }
@@ -158,6 +159,22 @@ public class SodiumWorldRenderer implements ChunkStatusListener {
         return this.chunkRenderManager.isBuildComplete();
     }
 
+    private boolean wasRenderingShadows = false;
+
+    public void restoreStateIfShadowsWereBeingRendered() {
+        if (wasRenderingShadows && !ShadowRenderingState.areShadowsCurrentlyBeingRendered()) {
+            this.chunkRenderManager.swapState();
+            wasRenderingShadows = false;
+        }
+    }
+
+    private void ensureStateSwapped() {
+        if (!wasRenderingShadows && ShadowRenderingState.areShadowsCurrentlyBeingRendered()) {
+            this.chunkRenderManager.swapState();
+            wasRenderingShadows = true;
+        }
+    }
+
     /**
      * Called prior to any chunk rendering in order to update necessary state.
      */
@@ -166,9 +183,7 @@ public class SodiumWorldRenderer implements ChunkStatusListener {
 
         this.useEntityCulling = SodiumClientMod.options().advanced.useAdvancedEntityCulling;
 
-        if (this.client.options.viewDistance != this.renderDistance) {
-            this.reload();
-        }
+        ensureStateSwapped();
 
         Profiler profiler = this.client.getProfiler();
         profiler.push("camera_setup");
@@ -179,29 +194,33 @@ public class SodiumWorldRenderer implements ChunkStatusListener {
             throw new IllegalStateException("Client instance has no active player entity");
         }
 
-        Vec3d cameraPos = camera.getPos();
-
-        this.chunkRenderManager.setCameraPosition(cameraPos.x, cameraPos.y, cameraPos.z);
-
+        Vec3d pos = camera.getPos();
         float pitch = camera.getPitch();
         float yaw = camera.getYaw();
 
-        boolean dirty = cameraPos.x != this.lastCameraX || cameraPos.y != this.lastCameraY || cameraPos.z != this.lastCameraZ ||
+        boolean dirty = pos.x != this.lastCameraX || pos.y != this.lastCameraY || pos.z != this.lastCameraZ ||
                 pitch != this.lastCameraPitch || yaw != this.lastCameraYaw;
+
+        if (ShadowRenderingState.areShadowsCurrentlyBeingRendered()) {
+            // TODO: Detect when the sun/moon isn't moving
+            dirty = true;
+        }
 
         if (dirty) {
             this.chunkRenderManager.markDirty();
         }
 
-        this.lastCameraX = cameraPos.x;
-        this.lastCameraY = cameraPos.y;
-        this.lastCameraZ = cameraPos.z;
+        this.lastCameraX = pos.x;
+        this.lastCameraY = pos.y;
+        this.lastCameraZ = pos.z;
         this.lastCameraPitch = pitch;
         this.lastCameraYaw = yaw;
 
         profiler.swap("chunk_update");
 
-        this.chunkRenderManager.updateChunks();
+        if (!ShadowRenderingState.areShadowsCurrentlyBeingRendered()) {
+            this.chunkRenderManager.updateChunks();
+        }
 
         if (!hasForcedFrustum && this.chunkRenderManager.isDirty()) {
             profiler.swap("chunk_graph_rebuild");
@@ -222,6 +241,8 @@ public class SodiumWorldRenderer implements ChunkStatusListener {
      * Performs a render pass for the given {@link RenderLayer} and draws all visible chunks for it.
      */
     public void drawChunkLayer(RenderLayer renderLayer, MatrixStack matrixStack, double x, double y, double z) {
+        restoreStateIfShadowsWereBeingRendered();
+
         BlockRenderPass pass = this.renderPassManager.getRenderPassForLayer(renderLayer);
         pass.startDrawing();
 
@@ -251,7 +272,7 @@ public class SodiumWorldRenderer implements ChunkStatusListener {
             this.chunkRenderBackend = null;
         }
 
-        this.renderDistance = this.client.options.viewDistance;
+        RenderDevice device = RenderDevice.INSTANCE;
 
         SodiumGameOptions opts = SodiumClientMod.options();
 
@@ -268,32 +289,22 @@ public class SodiumWorldRenderer implements ChunkStatusListener {
         // override it all
         vertexFormat = DefaultModelVertexFormats.MODEL_VERTEX_XHFP;
 
-        this.chunkRenderBackend = createChunkRenderBackend(opts.advanced.chunkRendererBackend, vertexFormat);
-        this.chunkRenderBackend.createShaders();
+        this.chunkRenderBackend = createChunkRenderBackend(device, opts, vertexFormat);
+        this.chunkRenderBackend.createShaders(device);
 
-        this.chunkRenderManager = new ChunkRenderManager<>(this, this.chunkRenderBackend, this.renderPassManager, this.world, this.renderDistance);
+        this.chunkRenderManager = new ChunkRenderManager<>(this, this.chunkRenderBackend, this.renderPassManager, this.world, this.client.options.viewDistance);
         this.chunkRenderManager.restoreChunks(this.loadedChunkPositions);
     }
 
-    private static ChunkRenderBackend<?> createChunkRenderBackend(SodiumGameOptions.ChunkRendererBackendOption opt,
+    private static ChunkRenderBackend<?> createChunkRenderBackend(RenderDevice device,
+                                                                  SodiumGameOptions options,
                                                                   ChunkVertexType vertexFormat) {
         boolean disableBlacklist = SodiumClientMod.options().advanced.disableDriverBlacklist;
 
-        switch (opt) {
-            case GL43:
-                if (GL43ChunkRenderBackend.isSupported(disableBlacklist)) {
-                    return new GL43ChunkRenderBackend(vertexFormat);
-                }
-            case GL30:
-                if (GL30ChunkRenderBackend.isSupported(disableBlacklist)) {
-                    return new GL30ChunkRenderBackend(vertexFormat);
-                }
-            case GL20:
-                if (GL20ChunkRenderBackend.isSupported(disableBlacklist)) {
-                    return new GL20ChunkRenderBackend(vertexFormat);
-                }
-            default:
-                throw new IllegalArgumentException("No suitable chunk render backends exist");
+        if (options.advanced.useMultidraw && MultidrawChunkRenderBackend.isSupported(disableBlacklist)) {
+            return new MultidrawChunkRenderBackend(device, vertexFormat);
+        } else {
+            return new ChunkRenderBackendOneshot(vertexFormat);
         }
     }
 
